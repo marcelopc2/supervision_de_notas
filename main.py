@@ -182,7 +182,7 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
     # Info de enrollments (profesor, tutor, director)
     teacher_data = fetch_canvas_api(
         f"/courses/{course_id}/enrollments",
-        params={"type[]": "TeacherEnrollment", "per_page": 100}
+        params={"role[]": "TeacherEnrollment", "per_page": 100}
     )
     if teacher_data:
         t = teacher_data[0]

@@ -239,7 +239,8 @@ def style_celda(val: str):
 # Interfaz principal
 # ---------------------------------------------------------------------
 st.title("VERIFICADOR de calificaciones en Canvas")
-st.info("Sirve para ver si los profes han puesto las notas a tiempo o no.")
+st.success("Sirve para ver si los profes han puesto las notas a tiempo o no.")
+st.info("Ultima correcion: Cambiado la forma de buscar al profesor de type[] a role[].")
 
 raw_input = st.text_area(
     "IDs de curso (separados por coma, espacio o salto de línea):",

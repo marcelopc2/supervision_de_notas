@@ -7,7 +7,7 @@ from decouple import config
 from typing import Tuple
 import pytz  # <-- Importamos pytz para manejar zonas horarias
 
-st.set_page_config(layout="wide")  # Modo ancho
+st.set_page_config(layout="wide", page_title="Supervision de notas al dia 💯", page_icon="💯")  # Modo ancho
 
 # Ajusta a tu zona horaria
 tz_local = pytz.timezone("America/Santiago")
@@ -304,10 +304,10 @@ if st.button("Revisar calificaciones!"):
                 # Resumen final
                 if not asg_ok:
                     estado = "No tiene fechas configuradas"
-                    color_estado = "yellow"
+                    color_estado = "orange"
                 else:
                     all_values = df.values.flatten().tolist()
-                    if any(v.lower() in ["no calificado en plazo", "no entrego nada"] for v in all_values):
+                    if any(str(v).strip().lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide"] for v in all_values):
                         estado = "Hay cosas mal"
                         color_estado = "red"
                     else:

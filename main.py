@@ -153,12 +153,15 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
             if now_utc < due_date_utc:
                 text_celda = "No aplica aun"
             elif graded_at:
-                # Calificada => nota en verde
-                score = submission.get("score") if submission else None
-                try:
-                    text_celda = str(int(float(score))) if score is not None else "0"
-                except:
-                    text_celda = "0"
+                if submission and submission.get("grade_matches_current_submission") is False:
+                    text_celda = "Nota no coincide"
+                else:
+                    # Calificada => nota en verde
+                    score = submission.get("score") if submission else None
+                    try:
+                        text_celda = str(int(float(score))) if score is not None else "0"
+                    except:
+                        text_celda = "0"
             else:
                 # No calificado
                 if now_utc <= deadline_utc:
@@ -229,12 +232,13 @@ def style_celda(val: str):
         return "background-color: lightgreen; color: black"
     if v in ["entregado y en plazo", "no entregado pero en plazo"]:
         return "background-color: lightblue; color: black"
-    if v in ["no calificado en plazo"]:
+    if v == "no calificado en plazo":
         return "background-color: yellow; color: black"
-    if v in ["no entrego nada"]:
+    if v == "no entrego nada":
         return "background-color: red; color: white"
+    if v == "nota no coincide":
+        return "background-color: orange; color: black"
     return ""
-
 # ---------------------------------------------------------------------
 # Interfaz principal
 # ---------------------------------------------------------------------
@@ -288,7 +292,7 @@ if st.button("Revisar calificaciones!"):
                     # 1) Contar cuántos alumnos están fuera de plazo
                     outside_plazo_count = 0
                     for val in df.values.flatten():
-                        if val.lower() in ["no calificado en plazo", "no entrego nada"]:
+                        if val.lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide"]:
                             outside_plazo_count += 1
 
                     st.write(f"**Faltan por calificar (fuera de plazo):** {outside_plazo_count}")

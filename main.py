@@ -21,24 +21,26 @@ HEADERS = {
 }
 
 def fetch_canvas_api(endpoint, params=None):
-    """Llamada GET a la API de Canvas con manejo de paginación."""
     full_url = f"{BASE_URL}{endpoint}"
-    results = []  # Lista para almacenar todos los resultados
+    results = []
+    
+    response = requests.get(full_url, headers=HEADERS, params=params)
+    if response.status_code == 404:
+        return None 
+    response.raise_for_status()
 
-    while full_url:  # Mientras haya una página siguiente
-        response = requests.get(full_url, headers=HEADERS, params=params)
+    data = response.json()
+    if not isinstance(data, list):
+        return data 
+
+    results.extend(data)
+    while response.links.get("next"):
+        url = response.links["next"]["url"]
+        response = requests.get(url, headers=HEADERS)
         response.raise_for_status()
-        
-        data = response.json()
-        if isinstance(data, list):  # Canvas devuelve listas en respuestas paginadas
-            results.extend(data)
-        else:
-            return data  # Si no es lista, devolver directamente
+        results.extend(response.json())
 
-        # Verificar si hay más páginas en los headers de la respuesta
-        full_url = response.links.get("next", {}).get("url")  
-
-    return results  # Devolver la lista completa si había paginación
+    return results
 
 def es_entrega_real(submission: dict) -> bool:
     """
@@ -53,6 +55,19 @@ def es_entrega_real(submission: dict) -> bool:
     submitted_at = submission.get("submitted_at")
     return (w_state == "submitted") or (submitted_at is not None)
 
+def obtener_rol_info(course_id: str, role: str) -> Tuple[str, str]:
+    data = fetch_canvas_api(
+        f"/courses/{course_id}/enrollments",
+        params={"role[]": role, "per_page": 100}
+    )
+    if not data:
+        return "No existe", "No existe"
+    # Extrae nombres y correos
+    names  = [e.get("user",{}).get("name",       "No existe") for e in data]
+    emails = [e.get("user",{}).get("login_id",   "No existe") for e in data]
+    # Une en un solo string
+    return ", ".join(names), ", ".join(emails)
+
 def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
     """
     Retorna:
@@ -61,7 +76,7 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
       3) Diccionario con info de Profesor, Tutor, Director.
     
     Lógica en cada celda:
-      - "No aplica aun"                -> si now_utc < due_date_utc
+      - "No iniciado"                -> si now_utc < due_date_utc
       - Si graded_at existe            -> nota en verde
       - Si no calificado:
          * en plazo (<= due_date_utc+9):
@@ -99,6 +114,9 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
 
     now_utc = datetime.now(timezone.utc)  # Momento actual en UTC
 
+    asignaciones_info = []
+    now_local_date = datetime.now(tz_local).date()
+    
     for assignment in assignments:
         asg_id = assignment.get("id")
         asg_name = assignment.get("name")
@@ -122,18 +140,25 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
 
         # Lógica en UTC para decidir el "estado_info"
         if due_date_utc > now_utc:
-            estado_info = "NO APLICA AUN"
+            estado_info = "No iniciado"
         else:
             if now_utc > deadline_utc:
-                estado_info = "VENCIDO"
+                estado_info = "Plazo vencido"
             else:
-                estado_info = "EN PLAZO"
+                estado_info = "En plazo"
+                
+        dias_atraso = (now_local_date - deadline_local.date()).days
+        if dias_atraso < 0:
+            dias_atraso = 0
 
         # st.info con las fechas locales
-        st.info(
-            f"**{asg_name}** - **Fecha de entrega:** :green[{fecha_entrega_str}] "
-            f"- **Plazo de calificación:** :green[{plazo_calif_str}] - **:red[{estado_info}]**"
-        )
+        asignaciones_info.append({
+            "Tarea": asg_name,
+            "Fecha de entrega": fecha_entrega_str,
+            "Plazo de calificación": plazo_calif_str,
+            "Días de atraso": dias_atraso if estado_info == "Plazo vencido" else "No aplica",
+            "Estado": estado_info
+        })
 
         processed_assignments.append(assignment)
 
@@ -151,17 +176,17 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
 
             # Comparación en UTC
             if now_utc < due_date_utc:
-                text_celda = "No aplica aun"
+                text_celda = "No iniciado"
             elif graded_at:
-                if submission and submission.get("grade_matches_current_submission") is False:
+                # Si Canvas dice "graded" pero no hay score, mostramos "-"
+                score = submission.get("score")
+                if score is None:
+                    text_celda = "Calificada pero sin nota"
+                elif submission.get("grade_matches_current_submission") is False:
                     text_celda = "Nota no coincide"
                 else:
-                    # Calificada => nota en verde
-                    score = submission.get("score") if submission else None
-                    try:
-                        text_celda = str(int(float(score))) if score is not None else "0"
-                    except:
-                        text_celda = "0"
+                    # Convertimos a entero sólo si score es un número válido
+                    text_celda = str(int(float(score)))
             else:
                 # No calificado
                 if now_utc <= deadline_utc:
@@ -176,6 +201,20 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
                         text_celda = "No entrego nada"
 
             results[sid][asg_name] = text_celda
+            
+    if asignaciones_info:
+        df_asg = pd.DataFrame(asignaciones_info)
+        # Si quieres colorear la columna "Estado":
+        def color_estado_asg(v):
+            v = v.lower()
+            if v == "no iniciado":                return "background-color: black; color: white"
+            if v == "en plazo":                   return "background-color: lightgreen"
+            if v == "plazo vencido":             return "background-color: lightcoral"
+            return ""
+        styler = df_asg.style.map(color_estado_asg, subset=["Estado"])
+        st.dataframe(styler, use_container_width=False, hide_index=True)
+    else:
+        st.info("No hay tareas con fecha de entrega.")
 
     df = pd.DataFrame.from_dict(
         {students[sid]: data for sid, data in results.items()},
@@ -183,42 +222,58 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
     )
 
     # Info de enrollments (profesor, tutor, director)
+    # Profesores
     teacher_data = fetch_canvas_api(
         f"/courses/{course_id}/enrollments",
         params={"role[]": "TeacherEnrollment", "per_page": 100}
     )
+    teacher_names = []
+    teacher_emails = []
     if teacher_data:
-        t = teacher_data[0]
-        teacher_name = t.get("user", {}).get("name", "no existe")
-        teacher_email = t.get("user", {}).get("login_id", "no existe")
+        for t in teacher_data:
+            user = t.get("user", {})
+            teacher_names.append(user.get("name", "No existe"))
+            teacher_emails.append(user.get("login_id", "No existe"))
     else:
-        teacher_name, teacher_email = "no existe", "no existe"
+        teacher_names = ["No existe"]
+        teacher_emails = ["No existe"]
 
+    # Tutores
     tutor_data = fetch_canvas_api(
         f"/courses/{course_id}/enrollments",
         params={"role[]": "Tutor social", "per_page": 100}
     )
+    tutor_emails = []
     if tutor_data:
-        tu = tutor_data[0]
-        tutor_email = tu.get("user", {}).get("login_id", "No existe")
+        for tu in tutor_data:
+            user = tu.get("user", {})
+            tutor_emails.append(user.get("login_id", "No existe"))
     else:
-        tutor_email = "No existe"
+        tutor_emails = ["No existe"]
 
+    # Directores
     director_data = fetch_canvas_api(
         f"/courses/{course_id}/enrollments",
         params={"role[]": "Director", "per_page": 100}
     )
+    director_names = []
+    director_emails = []
     if director_data:
-        d = director_data[0]
-        director_name = d.get("user", {}).get("name", "No existe")
+        for d in director_data:
+            user = d.get("user", {})
+            director_names.append(user.get("name", "No existe"))
+            director_emails.append(user.get("login_id", "No existe"))
     else:
-        director_name = "No existe"
+        director_names = ["No existe"]
+        director_emails = ["No existe"]
 
+    # Crear string unificado si quieres mostrarlos como texto
     info_curso = {
-        "Profesor": teacher_name,
-        "Correo Profesor": teacher_email,
-        "Tutor": tutor_email,
-        "Director": director_name
+        "Profesor": ", ".join(teacher_names),
+        "Correo Profesor": ", ".join(teacher_emails),
+        "Tutor": ", ".join(tutor_emails),
+        "Director": ", ".join(director_names),
+        "Correo Director": ", ".join(director_emails)
     }
 
     return df, processed_assignments, info_curso
@@ -226,7 +281,7 @@ def procesar_curso(course_id: str) -> Tuple[pd.DataFrame, list, dict]:
 def style_celda(val: str):
     """Colores según el valor en la celda."""
     v = val.strip().lower()
-    if v == "no aplica aun":
+    if v == "No iniciado":
         return "background-color: black; color: white"
     if v.isdigit():
         return "background-color: lightgreen; color: black"
@@ -238,20 +293,20 @@ def style_celda(val: str):
         return "background-color: red; color: white"
     if v == "nota no coincide":
         return "background-color: orange; color: black"
+    if v == "calificada pero sin nota":
+        return "background-color: orange; color: black"
     return ""
-# ---------------------------------------------------------------------
-# Interfaz principal
-# ---------------------------------------------------------------------
-st.title("VERIFICADOR de calificaciones en Canvas")
-st.success("Sirve para ver si los profes han puesto las notas a tiempo o no.")
-st.info("Ultima correcion: Cambiado la forma de buscar al profesor de type[] a role[].")
+
+st.title("Supervision de notas al dia 💯")
+st.success("Con esta herramientasa puedes revisar el estado de las calificaciones de tus cursos a supervisar en Canvas.")
+#st.info("Ultima correcion: Cambiado la forma de buscar al profesor de type[] a role[].")
 
 raw_input = st.text_area(
     "IDs de curso (separados por coma, espacio o salto de línea):",
-    placeholder="Ej: 123456, 234567 345678\n456789"
+    placeholder="Ej: 123456, 234567 345678\n456789", height=200
 )
 
-if st.button("Revisar calificaciones!"):
+if st.button("Revisar!!", use_container_width=True):
     inicio_total = datetime.now()
     course_ids = [c.strip() for c in re.split(r"[\s,]+", raw_input) if c.strip()]
     if not course_ids:
@@ -262,40 +317,68 @@ if st.button("Revisar calificaciones!"):
             st.divider()
             # Info extra del curso (opcional)
             course_info = fetch_canvas_api(f"/courses/{cid}")
+            if not course_info:
+                st.error(f"Curso {cid} no encontrado.")
+                resumen.append({
+                    "Estado": "Inexistente",
+                    "Errores": "No encontrado",
+                    "Curso": "No encontrado",
+                    "Nombre":"No encontrado",
+                    "Diplomado":"No encontrado",
+                    "Profesor": "No encontrado",
+                    "Email Profesor":"No encontrado",
+                    "Director": "No encontrado",
+                    "Email Director": "No encontrado",
+                    "Tutor": "No encontrado",
+                    "Color": "red"
+                })
+                continue
             sub_account_info = fetch_canvas_api(f"/accounts/{course_info.get('account_id')}")
 
             st.markdown(
-                f"### [{sub_account_info.get('name')} - ({sub_account_info.get('id')})]"
-                f"(https://canvas.uautonoma.cl/accounts/{sub_account_info.get('id')})",
+                f"##### [({course_info.get('id')}) {course_info.get('name')} / "
+                f"{course_info.get('course_code')}](https://canvas.uautonoma.cl/courses/{cid}/gradebook)",
                 unsafe_allow_html=True
             )
             st.markdown(
-                f"##### [{course_info.get('name')} - ({course_info.get('id')}) - "
-                f"{course_info.get('course_code')}](https://canvas.uautonoma.cl/courses/{cid}/gradebook)",
+                f"###### [({sub_account_info.get('id')}) {sub_account_info.get('name')}]"
+                f"(https://canvas.uautonoma.cl/accounts/{sub_account_info.get('id')})",
                 unsafe_allow_html=True
             )
             try:
                 df, asg_ok, info_curso = procesar_curso(cid)
                 
                 # Info del curso
-                st.markdown(
-                    f"**Profesor:** {info_curso.get('Profesor')} | "
-                    f"**Correo:** {info_curso.get('Correo Profesor')}<br>"
-                    f"**Tutor:** {info_curso.get('Tutor')} | "
-                    f"**Director:** {info_curso.get('Director')}",
-                    unsafe_allow_html=True
-                )
+                # st.markdown(
+                #     f"**Profesor:** {info_curso.get('Profesor')} | "
+                #     f"**Correo:** {info_curso.get('Correo Profesor')}<br>"
+                #     f"**Tutor:** {info_curso.get('Tutor')} | "
+                #     f"**Director:** {info_curso.get('Director')}",
+                #     unsafe_allow_html=True
+                # )
+                lista_info = []
+                lista_info.append({
+                    "Profesor": info_curso["Profesor"],
+                    "Email Profesor":   info_curso["Correo Profesor"],
+                    "Director": info_curso["Director"],
+                    "Email Director": info_curso["Correo Director"],
+                    "Email Tutor":    info_curso["Tutor"],
+                })
+                df_resumen_info = pd.DataFrame(lista_info)
+                st.dataframe(df_resumen_info, use_container_width=True, hide_index=True)
+                
                 if df is not None and not df.empty:
                     styler = df.style.map(style_celda)
-                    st.write(styler.to_html(), unsafe_allow_html=True)
+                    #st.write(styler.to_html(), unsafe_allow_html=True)
+                    st.dataframe(styler, use_container_width=True)
 
-                    # 1) Contar cuántos alumnos están fuera de plazo
+                    # Contar cuántos alumnos están fuera de plazo
                     outside_plazo_count = 0
                     for val in df.values.flatten():
-                        if val.lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide"]:
+                        if val.lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide", "calificada pero sin nota"]:
                             outside_plazo_count += 1
 
-                    st.write(f"**Faltan por calificar (fuera de plazo):** {outside_plazo_count}")
+                    st.write(f"**Notas fuera de plazo:** {outside_plazo_count}")
 
                 else:
                     st.info("No se procesaron asignaciones con fecha de entrega.")
@@ -303,11 +386,12 @@ if st.button("Revisar calificaciones!"):
 
                 # Resumen final
                 if not asg_ok:
-                    estado = "No tiene fechas configuradas"
+                    estado = "No configurado"
                     color_estado = "orange"
                 else:
                     all_values = df.values.flatten().tolist()
-                    if any(str(v).strip().lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide"] for v in all_values):
+                    #print(all_values)
+                    if any(str(v).strip().lower() in ["no calificado en plazo", "no entrego nada", "nota no coincide", "calificada pero sin nota"] for v in all_values):
                         estado = "Hay cosas mal"
                         color_estado = "red"
                     else:
@@ -316,15 +400,16 @@ if st.button("Revisar calificaciones!"):
 
                 # Agregamos el conteo 'outside_plazo_count' al resumen
                 resumen.append({
+                    "Estado": estado,
+                    "Errores": outside_plazo_count,
                     "Curso": cid,
                     "Nombre":course_info.get("name"),
                     "Diplomado":sub_account_info.get("name"),
                     "Profesor": info_curso.get("Profesor"),
-                    "Correo Profesor": info_curso.get("Correo Profesor"),
-                    "Tutor": info_curso.get("Tutor"),
+                    "Email Profesor": info_curso.get("Correo Profesor"),
                     "Director": info_curso.get("Director"),
-                    "Faltan fuera de plazo": outside_plazo_count,
-                    "Estado": estado,
+                    "Email Director": info_curso.get("Correo Director"),
+                    "Tutor": info_curso.get("Tutor"),
                     "Color": color_estado
                 })
 
@@ -345,6 +430,7 @@ if st.button("Revisar calificaciones!"):
                 return ""
 
             styler_resumen = df_resumen.style.map(style_resumen_cell, subset=["Estado"])
-            st.write(styler_resumen.to_html(escape=False), unsafe_allow_html=True)
+            #st.write(styler_resumen.to_html(escape=False), unsafe_allow_html=True)
+            st.dataframe(styler_resumen, use_container_width=True, hide_index=False)
 
         st.markdown(f"**Tiempo total del proceso:** {tiempo_total:.2f} segundos")
